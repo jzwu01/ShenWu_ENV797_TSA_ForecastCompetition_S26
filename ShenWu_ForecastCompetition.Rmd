@@ -1,0 +1,268 @@
+---
+title: "ENV797 - Forecasting Competition: First Submission"
+author: "Joy Wu, Aisha Shen"
+output: pdf_document
+always_allow_html: true
+editor_options: 
+  chunk_output_type: inline
+  markdown: 
+    wrap: sentence
+---
+
+## Setting R code chunk options
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,tidy.opts=list(width.cutoff=80), tidy=FALSE) 
+```
+
+## Loading packages
+
+```{r package, message=FALSE, warning=FALSE}
+library(lubridate)
+library(ggplot2)
+library(forecast)  
+library(Kendall)
+library(tseries)
+library(outliers)
+library(tidyverse)
+library(smooth)
+library(zoo)
+library(kableExtra)
+library(readxl)
+```
+
+## Importing data
+
+The dataset comes from the Kaggle competition platform. There are three files: hourly electricity demand (load), hourly temperature, and hourly relative humidity from January 2005 to June 2011. The load file has one row per day with 24 columns (h1 to h24) representing hourly readings. The temperature and humidity files have one row per hour with readings from 28 weather stations.
+
+```{r}
+#Importing data from excel files
+load_data <- read_excel("./Data/load.xlsx")
+temp_data <- read_excel("./Data/temperature.xlsx")
+rh_data   <- read_excel("./Data/relative_humidity.xlsx")
+
+#Inspect load data
+head(load_data)
+nobs <- nrow(load_data)
+summary(load_data[,3:26]) #summary of hourly columns only
+```
+## Wrangling and Processing the Dataset
+
+We need to transform the hourly data into daily data by taking the average of the 24-hour data points. The load file already has one row per day with columns h1 through h24, so we average across columns. For temperature and humidity, we aggregate hourly observations to daily means using pipes.
+
+### Processing load data
+```{r}
+load_daily <- load_data %>%
+  mutate(date = ymd(date)) %>%
+  rename(Date = date) %>%
+  pivot_longer(cols = h1:h24, 
+               names_to = "hour", 
+               values_to = "load") %>%
+  group_by(Date) %>%
+  summarise(daily_mean_load = mean(load, na.rm = TRUE)) 
+
+summary(load_daily)
+
+#Check for NAs in our processed daily load
+cat("Number of NAs in daily mean load:", 
+    sum(is.na(load_daily$daily_mean_load)), "\n")
+```
+### Processing temperature data
+
+```{r}
+temp_daily <- temp_data %>%
+  mutate(date = ymd(date)) %>%
+  rename(Date = date) %>%
+  pivot_longer(cols = t_ws1:t_ws28, 
+               names_to = "station", 
+               values_to = "temp") %>%
+  group_by(Date) %>%
+  summarise(daily_mean_temp = mean(temp, na.rm = TRUE)) %>%
+  filter(!is.na(Date))
+
+summary(temp_daily)
+
+```
+### Processing relative humidity data
+```{r}
+rh_daily <- rh_data %>%
+  mutate(date = ymd(date)) %>%
+  rename(Date = date) %>%
+  pivot_longer(cols = rh_ws1:rh_ws28, 
+               names_to = "station", 
+               values_to = "rh") %>%
+  group_by(Date) %>%
+  summarise(daily_mean_rh = mean(rh, na.rm = TRUE)) %>%
+  filter(!is.na(Date))
+summary(rh_daily)
+
+```
+### Combining all daily data into one data frame
+```{r}
+#Join load, temperature, and humidity into one data frame by date
+daily_data <- load_daily %>%
+  left_join(temp_daily, by = "Date") %>%
+  left_join(rh_daily, by = "Date")
+
+head(daily_data)
+summary(daily_data)
+```
+
+## Initial Plots
+```{r}
+#Plot daily load over time
+ggplot(daily_data, aes(x = Date, y = daily_mean_load)) +
+  geom_line(color = "blue") +
+  ylab("Daily Mean Load (Wh)") +
+  xlab("Date") +
+  ggtitle("Daily Electricity Demand: Jan 2005 - Jun 2011")
+
+#Plot daily temperature over time
+ggplot(daily_data, aes(x = Date, y = daily_mean_temp)) +
+  geom_line(color = "red") +
+  ylab("Daily Mean Temperature (F)") +
+  xlab("Date") +
+  ggtitle("Daily Temperature: Jan 2005 - Jun 2011")
+
+#Plot daily relative humidity over time
+ggplot(daily_data, aes(x = Date, y = daily_mean_rh)) +
+  geom_line(color = "green") +
+  ylab("Daily Mean Relative Humidity (%)") +
+  xlab("Date") +
+  ggtitle("Daily Relative Humidity: Jan 2005 - Jun 2011")
+```
+
+## Creating Time Series Objects
+Since this is daily data with more than one seasonal component (weekly and yearly patterns), we use `msts()` instead of `ts()`. The seasonal periods are 7 (weekly cycle) and 365.25 (yearly cycle, accounting for leap years).
+```{r}
+#Create msts object for daily load
+ts_daily_load <- msts(daily_data$daily_mean_load,
+                      seasonal.periods = c(7, 365.25),
+                      start = c(2005, 1, 1))
+
+#Create msts object for daily temperature (for potential future use)
+ts_daily_temp <- msts(daily_data$daily_mean_temp,
+                      seasonal.periods = c(7, 365.25),
+                      start = c(2005, 1, 1))
+
+#Create msts object for daily relative humidity (for potential future use)
+ts_daily_rh <- msts(daily_data$daily_mean_rh,
+                    seasonal.periods = c(7, 365.25),
+                    start = c(2005, 1, 1))
+
+```
+## Decomposing the Time Series
+
+Using `mstl()` from package `forecast` to decompose the multi-seasonal time series. 
+```{r}
+#Decompose daily load series using mstl
+ts_daily_load %>% mstl() %>%
+  autoplot() +
+  ggtitle("Decomposition of Daily Electricity Demand")
+```
+## ACF and PACF
+```{r}
+#ACF and PACF plots to inspect autocorrelation structure
+par(mfrow=c(1,2))
+Acf(daily_data$daily_mean_load, lag.max = 40, 
+    main = "ACF - Daily Load")
+Pacf(daily_data$daily_mean_load, lag.max = 40, 
+     main = "PACF - Daily Load")
+par(mfrow=c(1,1))
+```
+
+## Setting Up Training and Validation Sets
+
+Training data spans January 1, 2005 to June 30, 2010. The validation set is July 1, 2010 to July 31, 2010 (31 days). After selecting the best model, we retrain on the full dataset (January 2005 - June 2011) and forecast July 2011.
+```{r}
+#Count how many days fall in the training period (Jan 2005 - Jun 2010)
+n_train <- sum(daily_data$Date <= as.Date("2010-06-30"))
+
+#Count how many days fall in the validation period (Jul 2010)
+n_val <- sum(daily_data$Date >= as.Date("2010-07-01") & 
+             daily_data$Date <= as.Date("2010-07-31"))
+
+#Extract the training portion from the full time series
+ts_load_train <- subset(ts_daily_load, end = n_train)
+
+#Extract the validation portion
+ts_load_val <- subset(ts_daily_load, 
+                      start = n_train + 1, 
+                      end = n_train + n_val)
+
+#Plot both sets
+autoplot(ts_load_train) +
+  ylab("Daily Mean Load") +
+  ggtitle("Training Data: Jan 2005 - Jun 2010")
+
+autoplot(ts_load_val) +
+  ylab("Daily Mean Load") +
+  ggtitle("Validation Data: Jul 2010")
+```
+## Fitting Models and Forecasting
+
+### Model: Seasonal Naive
+```{r}
+#Fit seasonal naive model on training data
+snaive_fit <- snaive(ts_load_train, h = n_val)
+
+#Plot forecast
+autoplot(snaive_fit) +
+  ylab("Daily Mean Load") +
+  ggtitle("Seasonal Naive Forecast for Jul 2010 (Validation)")
+
+#Overlay forecast with actual validation data
+autoplot(ts_load_val) +
+  autolayer(snaive_fit, series = "Seasonal Naive", PI = FALSE) +
+  ylab("Daily Mean Load") +
+  ggtitle("Seasonal Naive vs Observed: Jul 2010")
+```
+
+
+## Checking Residuals
+
+Following M8, we use `checkresiduals()` to evaluate the model fit. We want residuals that resemble white noise: no patterns, centered around zero, normally distributed.
+```{r}
+#Check residuals for Seasonal Naive
+checkresiduals(snaive_fit)
+```
+## Checking Forecast Accuracy Score
+
+```{r}
+snaive_scores <- accuracy(SNAIVE_fit$mean, ts_load_val)
+snaive_scores
+```
+
+
+## Generating Final Forecast for Kaggle Submission
+```{r}
+#Retrain seasonal naive on the full dataset
+#ts_daily_load already covers Jan 2005 - Jun 2011
+snaive_final <- snaive(ts_daily_load, h = 31)
+
+#Plot the final forecast
+autoplot(snaive_final) +
+  ylab("Daily Mean Load") +
+  ggtitle("Seasonal Naive Forecast: Jul 2011 (Final Submission)")
+```
+## Creating Submission File
+
+The submission file must match the format of the provided template: a CSV with columns `date` and `load`.
+```{r}
+#Load submission template
+submission_template <- read.csv("~/ShenWu_ENV797_TSA_ForecastCompetition_S26/Ouput/submission_template.csv")
+
+#Create submission with forecasted values
+submission <- submission_template
+submission$load <- as.numeric(snaive_final$mean)
+
+#Inspect submission
+print(submission)
+
+#Save to csv
+write.csv(submission, 
+          file = "~/ShenWu_ENV797_TSA_ForecastCompetition_S26/Ouput/submission_snaive1.csv", 
+          row.names = FALSE)
+
+```
+
