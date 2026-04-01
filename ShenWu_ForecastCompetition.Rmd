@@ -248,25 +248,6 @@ checkresiduals(naive_fit)
 qqnorm(residuals(naive_fit))
 qqline(residuals(naive_fit), col = "red")
 ```
-```{r}
-f_snaive <- function(y, h) { snaive(y, h = h) }
-f_naive  <- function(y, h) { naive(y, h = h) }
-
-# Compute Cross-validation Errors (RMSE)
-# This may take a moment depending on the length of ts_load_train
-cv_snaive <- tsCV(ts_load_train, f_snaive, h = 1)
-cv_naive  <- tsCV(ts_load_train, f_naive, h = 1)
-
-# Calculate RMSE from CV
-rmse_cv_snaive <- sqrt(mean(cv_snaive^2, na.rm = TRUE))
-rmse_cv_naive  <- sqrt(mean(cv_naive^2, na.rm = TRUE))
-
-cat("CV RMSE for Seasonal Naive:", rmse_cv_snaive, "\n")
-cat("CV RMSE for Naive:", rmse_cv_naive, "\n")
-
-
-```
-
 
 ### Model: Seasonal Naive
 ```{r}
@@ -301,6 +282,45 @@ snaive_scores
 ```
 
 
+## Enhancing Model robustness with Cross Validation
+
+```{r}
+f_snaive <- function(y, h) { snaive(y, h = h) }
+f_naive  <- function(y, h) { naive(y, h = h) }
+
+# Compute Cross-validation Errors (RMSE)
+cv_snaive <- tsCV(ts_load_train, f_snaive, h = 1)
+cv_naive  <- tsCV(ts_load_train, f_naive, h = 1)
+
+# Calculate RMSE from CV
+rmse_cv_snaive <- sqrt(mean(cv_snaive^2, na.rm = TRUE))
+rmse_cv_naive  <- sqrt(mean(cv_naive^2, na.rm = TRUE))
+
+cat("CV RMSE for Seasonal Naive:", rmse_cv_snaive, "\n")
+cat("CV RMSE for Naive:", rmse_cv_naive, "\n")
+
+
+```
+```{r}
+# 1. Arithmetic Mean Fit
+fit_mean <- meanf(ts_load_train, h = n_val)
+
+# 2. Naive Fit
+fit_naive <- naive(ts_load_train, h = n_val)
+
+# 3. Seasonal Naive Fit
+fit_snaive <- snaive(ts_load_train, h = n_val)
+
+# Compare Accuracy on Validation Set
+accuracy_table <- rbind(
+  Mean = accuracy(fit_mean, ts_load_val)[2,],
+  Naive = accuracy(fit_naive, ts_load_val)[2,],
+  SNaive = accuracy(fit_snaive, ts_load_val)[2,]
+)
+print(accuracy_table)
+```
+
+
 ## Generating Final Forecast for Kaggle Submission
 ```{r}
 #Retrain seasonal naive on the full dataset
@@ -321,6 +341,7 @@ submission_template <- read.csv("/Users/meilishen/Documents/TimeSeries/ShenWu_EN
 
 #Create submission with forecasted values
 submission <- submission_template
+
 submission$load <- as.numeric(snaive_final$mean)
 
 #Inspect submission
@@ -333,3 +354,28 @@ write.csv(submission,
 
 ```
 
+
+```{r}
+
+# Retrain on full data
+final_mean   <- meanf(ts_daily_load, h = 31)
+final_naive  <- naive(ts_daily_load, h = 31)
+final_snaive <- snaive(ts_daily_load, h = 31)
+
+# Load template
+path_template <- "/Users/meilishen/Documents/TimeSeries/ShenWu_ENV797_TSA_ForecastCompetition_S26/Ouput/submission_template.csv"
+template <- read.csv(path_template)
+
+
+save_sub <- function(forecast_obj, filename) {
+  sub <- template
+  sub$load <- as.numeric(forecast_obj$mean)
+  write.csv(sub, file = paste0("/Users/meilishen/Documents/TimeSeries/ShenWu_ENV797_TSA_ForecastCompetition_S26/Ouput/", filename), row.names = FALSE)
+}
+
+# Generate the three files
+save_sub(final_mean,   "submission_1_mean.csv")
+save_sub(final_naive,  "submission_2_naive.csv")
+save_sub(final_snaive, "submission_3_snaive.csv")
+
+```
