@@ -200,6 +200,73 @@ autoplot(ts_load_val) +
   ggtitle("Validation Data: Jul 2010")
 ```
 ## Fitting Models and Forecasting
+### Model: Arithematic Mean
+```{r}
+# Fit mean model on training data
+mean_fit <- meanf(ts_load_train, h = n_val)
+
+# Plot forecast
+autoplot(mean_fit) +
+  ylab("Daily Mean Load") +
+  ggtitle("Arithmetic Mean Forecast (Validation)")
+
+# Overlay forecast with actual validation data
+autoplot(ts_load_val) +
+  autolayer(mean_fit, series = "Mean Forecast", PI = FALSE) +
+  ylab("Daily Mean Load") +
+  ggtitle("Mean Forecast vs Observed: Jul 2010")
+
+# Residual Analysis
+checkresiduals(mean_fit)
+
+# Q-Q Plot for Mean Model
+qqnorm(residuals(mean_fit))
+qqline(residuals(mean_fit), col = "red")
+```
+
+
+### Model: Naive
+```{r}
+# Fit naive model on training data
+naive_fit <- naive(ts_load_train, h = n_val)
+
+# Plot forecast
+autoplot(naive_fit) +
+  ylab("Daily Mean Load") +
+  ggtitle("Naive Forecast (Validation)")
+
+# Overlay forecast with actual validation data
+autoplot(ts_load_val) +
+  autolayer(naive_fit, series = "Naive Forecast", PI = FALSE) +
+  ylab("Daily Mean Load") +
+  ggtitle("Naive vs Observed: Jul 2010")
+
+# Residual Analysis
+checkresiduals(naive_fit)
+
+# Q-Q Plot for Naive Model
+qqnorm(residuals(naive_fit))
+qqline(residuals(naive_fit), col = "red")
+```
+```{r}
+f_snaive <- function(y, h) { snaive(y, h = h) }
+f_naive  <- function(y, h) { naive(y, h = h) }
+
+# Compute Cross-validation Errors (RMSE)
+# This may take a moment depending on the length of ts_load_train
+cv_snaive <- tsCV(ts_load_train, f_snaive, h = 1)
+cv_naive  <- tsCV(ts_load_train, f_naive, h = 1)
+
+# Calculate RMSE from CV
+rmse_cv_snaive <- sqrt(mean(cv_snaive^2, na.rm = TRUE))
+rmse_cv_naive  <- sqrt(mean(cv_naive^2, na.rm = TRUE))
+
+cat("CV RMSE for Seasonal Naive:", rmse_cv_snaive, "\n")
+cat("CV RMSE for Naive:", rmse_cv_naive, "\n")
+
+
+```
+
 
 ### Model: Seasonal Naive
 ```{r}
@@ -229,7 +296,7 @@ checkresiduals(snaive_fit)
 ## Checking Forecast Accuracy Score
 
 ```{r}
-snaive_scores <- accuracy(SNAIVE_fit$mean, ts_load_val)
+snaive_scores <- accuracy(snaive_fit$mean, ts_load_val)
 snaive_scores
 ```
 
@@ -250,7 +317,7 @@ autoplot(snaive_final) +
 The submission file must match the format of the provided template: a CSV with columns `date` and `load`.
 ```{r}
 #Load submission template
-submission_template <- read.csv("~/ShenWu_ENV797_TSA_ForecastCompetition_S26/Ouput/submission_template.csv")
+submission_template <- read.csv("/Users/meilishen/Documents/TimeSeries/ShenWu_ENV797_TSA_ForecastCompetition_S26/Ouput/submission_template.csv")
 
 #Create submission with forecasted values
 submission <- submission_template
@@ -261,7 +328,7 @@ print(submission)
 
 #Save to csv
 write.csv(submission, 
-          file = "~/ShenWu_ENV797_TSA_ForecastCompetition_S26/Ouput/submission_snaive1.csv", 
+          file = "/Users/meilishen/Documents/TimeSeries/ShenWu_ENV797_TSA_ForecastCompetition_S26/Ouput/submission_snaive1.csv", 
           row.names = FALSE)
 
 ```
