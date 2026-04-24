@@ -1,0 +1,448 @@
+---
+title: "ENV797 - Forecasting Competition: Second Submission Working Process"
+author: "Joy Wu, Aisha Shen"
+output: pdf_document
+always_allow_html: true
+editor_options: 
+  chunk_output_type: inline
+  markdown: 
+    wrap: sentence
+---
+
+## Setting R code chunk options
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,tidy.opts=list(width.cutoff=80), tidy=FALSE) 
+```
+
+## Loading packages
+
+```{r package, message=FALSE, warning=FALSE}
+library(lubridate)
+library(ggplot2)
+library(forecast)  
+library(Kendall)
+library(tseries)
+library(outliers)
+library(tidyverse)
+library(smooth)
+library(zoo)
+library(kableExtra)
+library(readxl)
+```
+
+## Importing data
+
+The dataset comes from the Kaggle competition platform. There are three files: hourly electricity demand (load), hourly temperature, and hourly relative humidity from January 2005 to June 2011. The load file has one row per day with 24 columns (h1 to h24) representing hourly readings. The temperature and humidity files have one row per hour with readings from 28 weather stations.
+
+```{r}
+#Importing data from excel files
+load_data <- read_excel("./Data/load.xlsx")
+temp_data <- read_excel("./Data/temperature.xlsx")
+rh_data   <- read_excel("./Data/relative_humidity.xlsx")
+
+#Inspect load data
+head(load_data)
+nobs <- nrow(load_data)
+summary(load_data[,3:26]) #summary of hourly columns only
+```
+## Wrangling and Processing the Dataset
+
+We need to transform the hourly data into daily data by taking the average of the 24-hour data points. The load file already has one row per day with columns h1 through h24, so we average across columns. For temperature and humidity, we aggregate hourly observations to daily means using pipes.
+
+### Processing load data
+```{r}
+load_daily <- load_data %>%
+  mutate(date = ymd(date)) %>%
+  rename(Date = date) %>%
+  pivot_longer(cols = h1:h24, 
+               names_to = "hour", 
+               values_to = "load") %>%
+  group_by(Date) %>%
+  summarise(daily_mean_load = mean(load, na.rm = TRUE)) 
+
+summary(load_daily)
+
+#Check for NAs in our processed daily load
+cat("Number of NAs in daily mean load:", 
+    sum(is.na(load_daily$daily_mean_load)), "\n")
+```
+### Processing temperature data
+
+```{r}
+temp_daily <- temp_data %>%
+  mutate(date = ymd(date)) %>%
+  rename(Date = date) %>%
+  pivot_longer(cols = t_ws1:t_ws28, 
+               names_to = "station", 
+               values_to = "temp") %>%
+  group_by(Date) %>%
+  summarise(daily_mean_temp = mean(temp, na.rm = TRUE)) %>%
+  filter(!is.na(Date))
+
+summary(temp_daily)
+
+```
+### Processing relative humidity data
+```{r}
+rh_daily <- rh_data %>%
+  mutate(date = ymd(date)) %>%
+  rename(Date = date) %>%
+  pivot_longer(cols = rh_ws1:rh_ws28, 
+               names_to = "station", 
+               values_to = "rh") %>%
+  group_by(Date) %>%
+  summarise(daily_mean_rh = mean(rh, na.rm = TRUE)) %>%
+  filter(!is.na(Date))
+summary(rh_daily)
+
+```
+### Combining all daily data into one data frame
+```{r}
+#Join load, temperature, and humidity into one data frame by date
+daily_data <- load_daily %>%
+  left_join(temp_daily, by = "Date") %>%
+  left_join(rh_daily, by = "Date")
+
+head(daily_data)
+summary(daily_data)
+```
+
+
+## Creating Time Series Objects
+Since this is daily data with more than one seasonal component (weekly and yearly patterns), we use `msts()` instead of `ts()`. The seasonal periods are 7 (weekly cycle) and 365.25 (yearly cycle, accounting for leap years).
+```{r}
+#Create msts object for daily load
+ts_daily_load <- msts(daily_data$daily_mean_load,
+                      seasonal.periods = c(7, 365.25),
+                      start = c(2005, 1, 1))
+
+```
+
+## Setting Up Training and Validation Sets
+ 
+Training: January 1, 2005 to June 30, 2010. Validation: July 1-31, 2010 (31 days). After selecting the best model, we retrain on the full dataset through June 2011 and forecast July 2011.
+
+```{r}
+#Count days in each period
+n_train <- sum(daily_data$Date <= as.Date("2010-06-30"))
+n_val   <- sum(daily_data$Date >= as.Date("2010-07-01") & 
+               daily_data$Date <= as.Date("2010-07-31"))
+ 
+cat("Training observations:", n_train, "\n")
+cat("Validation observations:", n_val, "\n")
+ 
+#Create training and validation subsets
+ts_load_train <- subset(ts_daily_load, end = n_train)
+ts_load_val   <- subset(ts_daily_load, 
+                        start = n_train + 1, 
+                        end = n_train + n_val)
+ 
+autoplot(ts_load_train) +
+  ylab("Daily Mean Load") +
+  ggtitle("Training Data: Jan 2005 - Jun 2010")
+ 
+autoplot(ts_load_val) +
+  ylab("Daily Mean Load") +
+  ggtitle("Validation Data: Jul 2010")
+```
+
+## Decomposing the Time Series
+
+Using `mstl()` to decompose the multi-seasonal training series and inspect the weekly and yearly seasonal components.
+```{r}
+ts_load_train %>% mstl() %>%
+  autoplot() +
+  ggtitle("Decomposition of Daily Load (Training Period)")
+```
+
+
+## ACF and PACF
+```{r}
+#ACF and PACF plots to inspect autocorrelation structure
+par(mfrow=c(1,2))
+Acf(daily_data$daily_mean_load[1:n_train], lag.max = 40, 
+    main = "ACF - Daily Load (Train)")
+Pacf(daily_data$daily_mean_load[1:n_train], lag.max = 40, 
+     main = "PACF - Daily Load (Train)")
+par(mfrow=c(1,1))
+```
+
+## Fitting Advanced Models
+ 
+Following the approaches from M9. We fit models on the training set, forecast 31 days ahead, and compare against the July 2010 validation set.
+ 
+### Model 1: STL + ETS
+ 
+Forecasts of `stl` objects are obtained using `stlf()`. ETS is applied to the seasonally adjusted data and the seasonal component is added back. R automatically selects the best ETS specification.
+
+```{r}
+#Fit and forecast STL + ETS model to training data
+ETS_fit <- stlf(ts_load_train, h = n_val)
+ 
+#Plot model + observed validation data
+autoplot(ts_load_val) +
+  autolayer(ETS_fit, series = "STL+ETS", PI = FALSE) +
+  ylab("Daily Mean Load") +
+  ggtitle("STL+ETS vs Observed: Jul 2010")
+```
+
+
+### Model 2: ARIMA + Fourier Terms (K=c(2,12))
+ 
+ARIMA model with Fourier terms as exogenous regressors to capture both weekly and yearly seasonal cycles. Using `lambda=0` for log transformation to keep forecasts positive.
+```{r}
+#K=c(2,12) means 2 Fourier pairs for weekly, 12 for yearly
+ARIMA_Four_fit <- auto.arima(ts_load_train,
+                             seasonal = FALSE,
+                             lambda = 0,
+                             xreg = fourier(ts_load_train,
+                                            K = c(2,12)))
+print(ARIMA_Four_fit)
+ 
+ARIMA_Four_for <- forecast(ARIMA_Four_fit,
+                           xreg = fourier(ts_load_train,
+                                          K = c(2,12),
+                                          h = n_val),
+                           h = n_val)
+ 
+autoplot(ts_load_val) +
+  autolayer(ARIMA_Four_for, series = "ARIMA+Fourier(2,12)", PI = FALSE) +
+  ylab("Daily Mean Load") +
+  ggtitle("ARIMA+Fourier (K=c(2,12)) vs Observed: Jul 2010")
+```
+
+
+### Model 3: ARIMA + Fourier Terms (K=c(2,6))
+Fewer yearly Fourier harmonics to test whether a simpler seasonal representation performs better.
+```{r}
+ARIMA_Four_fit2 <- auto.arima(ts_load_train,
+                              seasonal = FALSE,
+                              lambda = 0,
+                              xreg = fourier(ts_load_train,
+                                             K = c(2,6)))
+print(ARIMA_Four_fit2)
+ 
+ARIMA_Four_for2 <- forecast(ARIMA_Four_fit2,
+                            xreg = fourier(ts_load_train,
+                                           K = c(2,6),
+                                           h = n_val),
+                            h = n_val)
+ 
+autoplot(ts_load_val) +
+  autolayer(ARIMA_Four_for2, series = "ARIMA+Fourier(2,6)", PI = FALSE) +
+  ylab("Daily Mean Load") +
+  ggtitle("ARIMA+Fourier (K=c(2,6)) vs Observed: Jul 2010")
+```
+
+### Model 4: ARIMA + Fourier (K=c(3,12)) — Max Weekly Harmonics
+
+# K=3 is the maximum for weekly (floor(7/2)=3), giving a sharper weekly cycle
+```{r}
+ARIMA_Four_fit3 <- auto.arima(ts_load_train,
+                               seasonal = FALSE,
+                               lambda   = 0,
+                               xreg     = fourier(ts_load_train, K = c(3, 12)))
+print(ARIMA_Four_fit3)
+
+ARIMA_Four_for3 <- forecast(ARIMA_Four_fit3,
+                             xreg = fourier(ts_load_train, K = c(3, 12), h = n_val),
+                             h    = n_val)
+
+autoplot(ts_load_val) +
+  autolayer(ARIMA_Four_for3, series = "ARIMA+Fourier(3,12)", PI = FALSE) +
+  ylab("Daily Mean Load") +
+  ggtitle("ARIMA+Fourier (K=c(3,12)) vs Observed: Jul 2010")
+
+ARIMA_scores3 <- accuracy(ARIMA_Four_for3$mean, ts_load_val)
+cat("ARIMA+Fourier(3,12) RMSE:", ARIMA_scores3[,"RMSE"], "\n")
+```
+
+### Model 5: Neural Network (NNETAR + Fourier)
+ 
+Feed-forward neural network with lagged values and Fourier terms as inputs to capture multiple seasonalities.
+```{r}
+NN_fit <- nnetar(ts_load_train,
+                 p = 1,
+                 P = 0,
+                 xreg = fourier(ts_load_train, K = c(2,12)))
+ 
+NN_for <- forecast(NN_fit,
+                   h = n_val,
+                   xreg = fourier(ts_load_train,
+                                  K = c(2,12),
+                                  h = n_val))
+ 
+autoplot(ts_load_val) +
+  autolayer(NN_for, series = "NNETAR", PI = FALSE) +
+  ylab("Daily Mean Load") +
+  ggtitle("NNETAR+Fourier vs Observed: Jul 2010")
+```
+
+
+### Model 6: TBATS
+ 
+TBATS automatically selects the number of Fourier harmonics and handles multiple seasonalities internally. Can take several minutes to fit.
+```{r}
+TBATS_fit <- tbats(ts_load_train)
+ 
+TBATS_for <- forecast(TBATS_fit, h = n_val)
+ 
+autoplot(ts_load_val) +
+  autolayer(TBATS_for, series = "TBATS", PI = FALSE) +
+  ylab("Daily Mean Load") +
+  ggtitle("TBATS vs Observed: Jul 2010")
+```
+
+
+
+## Checking Accuracy of All Models
+```{r}
+#Compute accuracy for each model against July 2010 validation
+ETS_scores <- accuracy(ETS_fit$mean, ts_load_val)
+ARIMA_scores <- accuracy(ARIMA_Four_for$mean, ts_load_val)
+ARIMA_scores2 <- accuracy(ARIMA_Four_for2$mean, ts_load_val)
+ARIMA_scores3 <- accuracy(ARIMA_Four_for3$mean, ts_load_val)
+TBATS_scores <- accuracy(TBATS_for$mean, ts_load_val)
+NN_scores <- accuracy(NN_for$mean, ts_load_val)
+```
+
+
+### Compare Performance Metrics
+```{r}
+scores <- as.data.frame(
+  rbind(ETS_scores, ARIMA_scores, ARIMA_scores2, ARIMA_scores3,
+        TBATS_scores, NN_scores)
+)
+row.names(scores) <- c("STL+ETS", 
+                        "ARIMA+Fourier(2,12)", 
+                        "ARIMA+Fourier(2,6)",
+                        "ARIMA+Fourier(3,12)",
+                        "TBATS",
+                        "NNETAR+Fourier")
+ 
+#Best model by RMSE
+best_model_index <- which.min(scores[,"RMSE"])
+cat("The best model by RMSE is:", row.names(scores[best_model_index,]))
+ 
+kbl(scores, 
+    caption = "Forecast Accuracy for Daily Load - All Models (Jul 2010)",
+    digits = array(5, ncol(scores))) %>%
+  kable_styling(full_width = FALSE, position = "center", 
+                latex_options = "hold_position") %>%
+  kable_styling(latex_options = "striped", 
+                stripe_index = which.min(scores[,"RMSE"]))
+```
+
+
+### Plotting All Models Together
+```{r}
+autoplot(ts_load_val) +
+  autolayer(ETS_fit, series = "STL+ETS", PI = FALSE) +
+  autolayer(ARIMA_Four_for, series = "ARIMA+Fourier", PI = FALSE) +
+  autolayer(ARIMA_Four_for2, series = "ARIMA+Fourier2", PI = FALSE) +
+  autolayer(ARIMA_Four_for3, series = "ARIMA+Fourier3", PI = FALSE) +
+  autolayer(NN_for, series = "NNETAR", PI = FALSE) +
+  autolayer(TBATS_for, series = "TBATS", PI = FALSE) +
+  xlab("Day") + ylab("Daily Mean Load") +
+  guides(colour = guide_legend(title = "Forecast")) +
+  ggtitle("Base Models vs Observed: Jul 2010")
+ 
+```
+
+
+## Generating Final Forecasts for Kaggle Submission
+ 
+Retrain the best-performing models on the full dataset (January 2005 through June 2011) and forecast July 1-31, 2011. Multiple submissions allow us to compare Kaggle scores.
+
+```{r}
+# July 2011 forecast horizon
+h_final <- 31
+jul2011_dates <- seq(as.Date("2011-07-01"), as.Date("2011-07-31"), by = "day")
+temp_jul_proxy <- daily_data$daily_mean_temp[(n_train+1):(n_train+31)]
+```
+
+```{r}
+#--- Final Model A: STL + ETS ---
+ETS_final <- stlf(ts_daily_load, h = 31)
+ 
+#--- Final Model B: ARIMA + Fourier (K=c(2,12)) ---
+ARIMA_Four_final_fit <- auto.arima(ts_daily_load,
+                                   seasonal = FALSE,
+                                   lambda = 0,
+                                   xreg = fourier(ts_daily_load,
+                                                  K = c(2,12)))
+ 
+ARIMA_Four_final_for <- forecast(ARIMA_Four_final_fit,
+                                 xreg = fourier(ts_daily_load,
+                                                K = c(2,12),
+                                                h = 31),
+                                 h = 31)
+ 
+#--- Final Model C: ARIMA + Fourier (K=c(2,6)) ---
+ARIMA_Four_final_fit2 <- auto.arima(ts_daily_load,
+                                    seasonal = FALSE,
+                                    lambda = 0,
+                                    xreg = fourier(ts_daily_load,
+                                                   K = c(2,6)))
+ 
+ARIMA_Four_final_for2 <- forecast(ARIMA_Four_final_fit2,
+                                  xreg = fourier(ts_daily_load,
+                                                 K = c(2,6),
+                                                 h = 31),
+                                  h = 31)
+
+#--- Final Model D: ARIMA + Fourier (K=c(3,12)) ---
+ARIMA_Four_final_fit3 <- auto.arima(ts_daily_load,
+                                     seasonal = FALSE,
+                                     lambda   = 0,
+                                     xreg     = fourier(ts_daily_load, K = c(3, 12)))
+
+ARIMA_Four_final_for3 <- forecast(ARIMA_Four_final_fit3,
+                                   xreg = fourier(ts_daily_load, K = c(3, 12), h = h_final),
+                                   h    = h_final)
+
+#--- Final Model E: NNETAR + Fourier ---
+NN_final_fit <- nnetar(ts_daily_load,
+                       p = 1,
+                       P = 0,
+                       xreg = fourier(ts_daily_load, K = c(2,12)))
+ 
+NN_final_for <- forecast(NN_final_fit,
+                         h = 31,
+                         xreg = fourier(ts_daily_load,
+                                        K = c(2,12),
+                                        h = 31))
+ 
+#--- Final Model F: TBATS ---
+TBATS_final_fit <- tbats(ts_daily_load)
+TBATS_final_for <- forecast(TBATS_final_fit, h = 31)
+
+```
+
+## Creating Submission Files
+```{r}
+#Load submission template
+
+path_template <- "~/ShenWu_ENV797_TSA_ForecastCompetition_S26/Ouput/submission_template.csv"
+template <- read.csv(path_template)
+
+ 
+#Function to create submission file
+create_submission <- function(forecast_values, filename) {
+  submission <- template
+  submission$load <- as.numeric(forecast_values)
+  write.csv(submission, 
+            file = paste0("~/ShenWu_ENV797_TSA_ForecastCompetition_S26/Ouput/", filename),
+            row.names = FALSE)
+  cat("Saved:", filename, "\n")
+}
+ 
+#Generate all submission files
+create_submission(ETS_final$mean, "submission_stl_ets.csv")
+create_submission(ARIMA_Four_final_for$mean, "submission_arima_fourier_2_12.csv")
+create_submission(ARIMA_Four_final_for2$mean, "submission_arima_fourier_2_6.csv")
+create_submission(ARIMA_Four_final_for3$mean, "submission_arima_fourier_3_12.csv")
+create_submission(NN_final_for$mean, "submission_nnetar.csv")
+create_submission(TBATS_final_for$mean, "submission_tbats.csv")
+```
