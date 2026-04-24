@@ -418,38 +418,6 @@ NN_final_for <- forecast(NN_final_fit,
 TBATS_final_fit <- tbats(ts_daily_load)
 TBATS_final_for <- forecast(TBATS_final_fit, h = 31)
 
-
-
-## --- XGBoost Final: Retrain on full data, forecast Jul 2011 ---
-
-# For Jul 2011 we need lag features — pull from known data
-# lag7/14/21 come from Jun 2011; lag365 comes from Jul 2010
-jul2011_lags <- data.frame(
-  Date   = jul2011_dates,
-  lag7   = daily_data$daily_mean_load[(nrow(daily_data) - 30):(nrow(daily_data))],
-  lag14  = daily_data$daily_mean_load[(nrow(daily_data) - 37):(nrow(daily_data) - 7)],   
-  lag21  = daily_data$daily_mean_load[(nrow(daily_data) - 44):(nrow(daily_data) - 14)],
-  lag365 = daily_data$daily_mean_load[(n_train + 1):(n_train + 31)],  # Jul 2010
-  temp         = temp_jul_proxy,       # reuse Jul 2010 temp proxy from earlier
-  temp_sq      = temp_jul_proxy^2,
-  temp_roll7   = zoo::rollmean(c(tail(daily_data$daily_mean_temp, 6), temp_jul_proxy),
-                                k = 7, fill = NA, align = "right")[8:38]
-) %>%
-  mutate(
-    dow        = as.numeric(factor(weekdays(Date),
-                   levels = c("Monday","Tuesday","Wednesday",
-                              "Thursday","Friday","Saturday","Sunday"))),
-    month      = month(Date),
-    week       = week(Date),
-    doy        = yday(Date),
-    year       = year(Date),
-    is_weekend = as.numeric(dow >= 6),
-    roll7      = zoo::rollmean(c(tail(daily_data$daily_mean_load, 6), lag7),
-                                k = 7, fill = NA, align = "right")[8:38],
-    roll30     = zoo::rollmean(c(tail(daily_data$daily_mean_load, 29), lag7),
-                                k = 30, fill = NA, align = "right")[31:61]
-  )
-
 ```
 
 ## Creating Submission Files
