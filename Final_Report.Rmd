@@ -257,7 +257,7 @@ cat("Future regressor rows:", nrow(july_2011_features), "\n")
 Walk-forward CV with 1-month assessment windows, 1-month skip, and cumulative (expanding) training window. Two CV objects are created: a 5-year initial window (M1, M2, M3, M5) and a 4-year initial window (M4).
 
 ```{r cv-setup}
-# 5-year initial window: M1, M2, M3, M5
+# 5-year initial window: M1, M2, M3
 resamples_5yr <- time_series_cv(
   data       = train_data,
   date_var   = Date,
@@ -292,7 +292,7 @@ rec_with_reg <- recipe(
   data = train_data
 )
 
-# M2, M3, M4, M5: date only
+# M2, M3, M4: date only
 rec_no_reg <- recipe(
   daily_mean_load ~ Date,
   data = train_data
@@ -524,8 +524,7 @@ model_table <- modeltime_table(
 fit_m1, # M1: Prophet + regressors, tuned
 fit_m2, # M2: Prophet no regressors, tuned
 fit_m3, # M3: Prophet no regressors, tuned v2
-fit_m4, # M4: Prophet no regressors, baseline 4yr CV
-fit_m5 # M5: Prophet no regressors, baseline 5yr CV
+fit_m4 # M4: Prophet no regressors, baseline 4yr CV
 )
 calibration_table <- model_table %>%
 modeltime_calibrate(new_data = val_data)
@@ -535,7 +534,7 @@ cat("Refitting all models on full dataset (Jan 2005 - Jun 2011)...\n")
 refit_table <- calibration_table %>%
   modeltime_refit(data = full_data)
 
-# M1 requires future regressors; M2-M5 only need dates
+# M1 requires future regressors; M2-M4 only need dates
 future_with_reg <- july_2011_features
 future_no_reg   <- tibble(Date = july_dates_2011)
 
@@ -547,9 +546,9 @@ fcst_m1 <- refit_table %>%
     actual_data = full_data
   )
 
-# Forecast M2-M5 together (no regressors)
-fcst_m2_m5 <- refit_table %>%
-  filter(.model_id %in% c(2, 3, 4, 5)) %>%
+# Forecast M2-M4 together (no regressors)
+fcst_m2_m4 <- refit_table %>%
+  filter(.model_id %in% c(2, 3, 4)) %>%
   modeltime_forecast(
     new_data    = future_no_reg,
     actual_data = full_data
@@ -557,13 +556,12 @@ fcst_m2_m5 <- refit_table %>%
 
 # Extract prediction vectors
 preds_m1 <- fcst_m1    %>% filter(.key == "prediction") %>% pull(.value)
-preds_m2 <- fcst_m2_m5 %>% filter(.model_id == 2, .key == "prediction") %>% pull(.value)
-preds_m3 <- fcst_m2_m5 %>% filter(.model_id == 3, .key == "prediction") %>% pull(.value)
-preds_m4 <- fcst_m2_m5 %>% filter(.model_id == 4, .key == "prediction") %>% pull(.value)
-preds_m5 <- fcst_m2_m5 %>% filter(.model_id == 5, .key == "prediction") %>% pull(.value)
+preds_m2 <- fcst_m2_m4 %>% filter(.model_id == 2, .key == "prediction") %>% pull(.value)
+preds_m3 <- fcst_m2_m4 %>% filter(.model_id == 3, .key == "prediction") %>% pull(.value)
+preds_m4 <- fcst_m2_m4 %>% filter(.model_id == 4, .key == "prediction") %>% pull(.value)
 
 cat("Forecast lengths - M1:", length(preds_m1), "M2:", length(preds_m2),
-    "M3:", length(preds_m3), "M4:", length(preds_m4), "M5:", length(preds_m5), "\n")
+    "M3:", length(preds_m3), "M4:", length(preds_m4), "\n")
 
 # July 2011 forecast horizon
 h_final <- 31
