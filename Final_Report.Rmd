@@ -2,7 +2,6 @@
 title: "ENV 797 - Time Series Analysis for Energy and Environment Applications | Spring 2026"
 subtitle: "Forecasting Competition Final Report"
 author: "Joy Wu, Aisha Shen"
-subtitle: "GitHub Repository: [ShenWu_GithubRepo](https://github.com/jzwu01/ShenWu_ENV797_TSA_ForecastCompetition_S26)"
 output: pdf_document
 geometry: margin=2.54cm
 ---
