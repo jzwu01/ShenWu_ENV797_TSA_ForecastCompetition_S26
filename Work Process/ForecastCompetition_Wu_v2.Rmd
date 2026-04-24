@@ -420,8 +420,6 @@ TBATS_final_for <- forecast(TBATS_final_fit, h = 31)
 
 ```
 
-
-
 ## Creating Submission Files
 ```{r}
 #Load submission template

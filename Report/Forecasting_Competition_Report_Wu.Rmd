@@ -1,0 +1,181 @@
+---
+title: "ENV797 - Forecasting Competition: Final Report"
+author: "Joy Wu, Aisha Shen"
+output: pdf_document
+always_allow_html: true
+editor_options: 
+  chunk_output_type: inline
+  markdown: 
+    wrap: sentence
+---
+
+## Setting R code chunk options
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,tidy.opts=list(width.cutoff=80), tidy=FALSE) 
+```
+
+## Loading packages
+
+```{r package, message=FALSE, warning=FALSE}
+library(lubridate)
+library(ggplot2)
+library(forecast)  
+library(Kendall)
+library(tseries)
+library(outliers)
+library(tidyverse)
+library(smooth)
+library(zoo)
+library(kableExtra)
+library(readxl)
+```
+
+## Importing data
+
+The dataset comes from the Kaggle competition platform. There are three files: hourly electricity demand (load), hourly temperature, and hourly relative humidity from January 2005 to June 2011. The load file has one row per day with 24 columns (h1 to h24) representing hourly readings. The temperature and humidity files have one row per hour with readings from 28 weather stations.
+
+```{r}
+#Importing data from excel files
+load_data <- read_excel("./Data/load.xlsx")
+temp_data <- read_excel("./Data/temperature.xlsx")
+rh_data   <- read_excel("./Data/relative_humidity.xlsx")
+
+#Inspect load data
+head(load_data)
+nobs <- nrow(load_data)
+summary(load_data[,3:26]) #summary of hourly columns only
+```
+## Wrangling and Processing the Dataset
+
+We need to transform the hourly data into daily data by taking the average of the 24-hour data points. The load file already has one row per day with columns h1 through h24, so we average across columns. For temperature and humidity, we aggregate hourly observations to daily means using pipes.
+
+### Processing load data
+```{r}
+load_daily <- load_data %>%
+  mutate(date = ymd(date)) %>%
+  rename(Date = date) %>%
+  pivot_longer(cols = h1:h24, 
+               names_to = "hour", 
+               values_to = "load") %>%
+  group_by(Date) %>%
+  summarise(daily_mean_load = mean(load, na.rm = TRUE)) 
+
+summary(load_daily)
+
+#Check for NAs in our processed daily load
+cat("Number of NAs in daily mean load:", 
+    sum(is.na(load_daily$daily_mean_load)), "\n")
+```
+
+### Processing temperature data
+```{r}
+temp_daily <- temp_data %>%
+  mutate(date = ymd(date)) %>%
+  rename(Date = date) %>%
+  pivot_longer(cols = t_ws1:t_ws28, 
+               names_to = "station", 
+               values_to = "temp") %>%
+  group_by(Date) %>%
+  summarise(daily_mean_temp = mean(temp, na.rm = TRUE)) %>%
+  filter(!is.na(Date))
+
+summary(temp_daily)
+
+```
+
+### Processing relative humidity data
+```{r}
+rh_daily <- rh_data %>%
+  mutate(date = ymd(date)) %>%
+  rename(Date = date) %>%
+  pivot_longer(cols = rh_ws1:rh_ws28, 
+               names_to = "station", 
+               values_to = "rh") %>%
+  group_by(Date) %>%
+  summarise(daily_mean_rh = mean(rh, na.rm = TRUE)) %>%
+  filter(!is.na(Date))
+summary(rh_daily)
+
+```
+
+### Combining all daily data into one data frame
+```{r}
+#Join load, temperature, and humidity into one data frame by date
+daily_data <- load_daily %>%
+  left_join(temp_daily, by = "Date") %>%
+  left_join(rh_daily, by = "Date")
+
+head(daily_data)
+summary(daily_data)
+```
+
+
+## Creating Time Series Objects
+Since this is daily data with more than one seasonal component (weekly and yearly patterns), we use `msts()` instead of `ts()`. The seasonal periods are 7 (weekly cycle) and 365.25 (yearly cycle, accounting for leap years).
+```{r}
+#Create msts object for daily load
+ts_daily_load <- msts(daily_data$daily_mean_load,
+                      seasonal.periods = c(7, 365.25),
+                      start = c(2005, 1, 1))
+
+```
+
+
+## Setting Up Training and Validation Sets
+ 
+Training: January 1, 2005 to June 30, 2010. Validation: July 1-31, 2010 (31 days). After selecting the best model, we retrain on the full dataset through June 2011 and forecast July 2011.
+
+```{r}
+#Count days in each period
+n_train <- sum(daily_data$Date <= as.Date("2010-06-30"))
+n_val   <- sum(daily_data$Date >= as.Date("2010-07-01") & 
+               daily_data$Date <= as.Date("2010-07-31"))
+ 
+cat("Training observations:", n_train, "\n")
+cat("Validation observations:", n_val, "\n")
+ 
+#Create training and validation subsets
+ts_load_train <- subset(ts_daily_load, end = n_train)
+ts_load_val   <- subset(ts_daily_load, 
+                        start = n_train + 1, 
+                        end = n_train + n_val)
+```
+
+
+Based on the Kaggle scores, our top models are (INSERT MODEL NAMES), __, and TBATS. We will be fitting each of the advanced models on the training set, forecast 31 days ahead, and compare against the July 2010 validation set. Then we will forecast July 1-31, 2011.
+
+## Fitting Advanced Models
+ 
+We fit models on the training set, forecast 31 days ahead, and compare against the July 2010 validation set.
+ 
+### Model 1: 
+
+
+
+### Model 2: 
+
+
+### Model 3: 
+
+
+### Model 4: 
+
+
+### Model 5: TBATS
+```{r}
+TBATS_fit <- tbats(ts_load_train)
+ 
+TBATS_for <- forecast(TBATS_fit, h = n_val)
+ 
+autoplot(ts_load_val) +
+  autolayer(TBATS_for, series = "TBATS", PI = FALSE) +
+  ylab("Daily Mean Load") +
+  ggtitle("TBATS vs Observed: Jul 2010")
+```
+
+
+
+
+
+
