@@ -29,6 +29,12 @@ library(smooth)
 library(zoo)
 library(kableExtra)
 library(readxl)
+library(tidymodels)
+library(modeltime)
+library(timetk)
+library(tune)
+library(dials)
+
 ```
 
 ## Importing data
@@ -80,6 +86,13 @@ temp_daily <- temp_data %>%
   summarise(daily_mean_temp = mean(temp, na.rm = TRUE)) %>%
   filter(!is.na(Date))
 
+temp_daily_allsites <- temp_data %>%
+  mutate(date = ymd(date)) %>%
+  rename(Date = date) %>%
+  filter(!is.na(Date)) %>%        
+  group_by(Date) %>%
+  summarise(across(t_ws1:t_ws28, ~ mean(.x, na.rm = TRUE)))
+
 summary(temp_daily)
 
 ```
@@ -95,6 +108,13 @@ rh_daily <- rh_data %>%
   summarise(daily_mean_rh = mean(rh, na.rm = TRUE)) %>%
   filter(!is.na(Date))
 summary(rh_daily)
+
+rh_daily_allsites <- rh_data %>%
+  mutate(date = ymd(date)) %>%
+  rename(Date = date) %>%
+  filter(!is.na(Date)) %>%        
+  group_by(Date) %>%
+  summarise(across(rh_ws1:rh_ws28, ~ mean(.x, na.rm = TRUE)))
 
 ```
 ### Combining all daily data into one data frame
@@ -277,7 +297,7 @@ checkresiduals(snaive_fit)
 ## Checking Forecast Accuracy Score
 
 ```{r}
-snaive_scores <- accuracy(snaive_fit$mean, ts_load_val)
+snaive_scores <- forecast::accuracy(snaive_fit, ts_load_val)
 snaive_scores
 ```
 
@@ -313,9 +333,9 @@ fit_snaive <- snaive(ts_load_train, h = n_val)
 
 # Compare Accuracy on Validation Set
 accuracy_table <- rbind(
-  Mean = accuracy(fit_mean, ts_load_val)[2,],
-  Naive = accuracy(fit_naive, ts_load_val)[2,],
-  SNaive = accuracy(fit_snaive, ts_load_val)[2,]
+  Mean = forecast::accuracy(fit_mean, ts_load_val)[2,],
+  Naive = forecast::accuracy(fit_naive, ts_load_val)[2,],
+  SNaive = forecast::accuracy(fit_snaive, ts_load_val)[2,]
 )
 print(accuracy_table)
 ```
@@ -378,4 +398,287 @@ save_sub(final_mean,   "submission_1_mean.csv")
 save_sub(final_naive,  "submission_2_naive.csv")
 save_sub(final_snaive, "submission_3_snaive.csv")
 
+```
+
+```{r}
+
+df_final_condensed <- daily_data %>%
+  left_join(temp_daily_allsites, by = "Date") %>%   
+  left_join(rh_daily_allsites,   by = "Date") %>%
+  arrange(Date) %>%
+  fill(everything(), .direction = "downup")         
+
+train_data <- df_final_condensed %>% filter(Date <= as.Date("2010-06-30"))
+val_data   <- df_final_condensed %>% filter(Date >= as.Date("2010-07-01") &
+                                             Date <= as.Date("2010-07-31"))
+full_data  <- df_final_condensed %>% filter(Date <= as.Date("2011-06-30"))
+
+cat("Split sizes — Train:", nrow(train_data),
+    "| Val:", nrow(val_data),
+    "| Full:", nrow(full_data), "\n")
+
+historical_julys <- df_final_condensed %>%
+  filter(month(Date) == 7, year(Date) < 2011) %>%
+  mutate(
+    day_of_month = day(Date),
+    year_weight  = year(Date) - 2004   # 2005→1, 2006→2, …, 2010→6
+  )
+
+july_2011_wtd <- historical_julys %>%
+  group_by(day_of_month) %>%
+  summarise(across(
+    .cols  = where(is.numeric) & !contains("load") & !contains("year_weight"),
+    .fns   = ~ weighted.mean(.x, w = year_weight, na.rm = TRUE)
+  )) %>%
+  ungroup() %>%
+  mutate(Date = as.Date(paste0("2011-07-", str_pad(day_of_month, 2, pad = "0")))) %>%
+  select(Date, everything(), -day_of_month)
+
+cat("Historic-mean regressor rows:", nrow(july_2011_wtd), "\n")
+
+project_series <- function(col_data, n_ahead = 31) {
+  # col_data: named numeric vector with Date names (for ordering)
+  ts_obj <- ts(col_data, frequency = 365.25)
+  fit    <- auto.arima(ts_obj, seasonal = FALSE, stepwise = TRUE, approximation = TRUE)
+  as.numeric(forecast(fit, h = n_ahead)$mean)
+}
+
+regressor_cols <- df_final_condensed %>%
+  filter(Date <= as.Date("2011-06-30")) %>%
+  select(where(is.numeric) & !contains("load")) %>%
+  names()
+
+july_dates_2011 <- seq(as.Date("2011-07-01"), as.Date("2011-07-31"), by = "day")
+
+july_2011_model <- map_dfc(regressor_cols, function(col) {
+  col_vec <- full_data %>% arrange(Date) %>% pull(!!sym(col))
+  preds   <- project_series(col_vec, n_ahead = 31)
+  tibble(!!col := preds)
+}) %>%
+  mutate(Date = july_dates_2011) %>%
+  select(Date, everything())
+
+cat("Model-based regressor rows:", nrow(july_2011_model), "\n")
+
+
+REGRESSOR_APPROACH <- "wtd_mean"   # or "model_based"
+
+july_2011_features <- if (REGRESSOR_APPROACH == "wtd_mean") july_2011_wtd else july_2011_model
+
+
+resamples_tscv <- time_series_cv(
+  data       = train_data,
+  date_var   = Date,
+  initial    = "3 years",
+  assess     = "1 month",
+  skip       = "1 month",
+  cumulative = TRUE
+)
+
+cat("CV slices:", nrow(resamples_tscv), "\n")
+
+rec_prophet <- recipe(daily_mean_load ~ Date + daily_mean_temp + daily_mean_rh,
+                      data = train_data)
+
+rec_ml <- recipe(daily_mean_load ~ ., data = train_data) %>%
+  step_date(Date, features = c("month", "week", "dow"), label = TRUE) %>%
+  step_mutate(Date_num = as.numeric(Date)) %>%
+  step_rm(Date) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())   # helps GLM & some tree variants
+
+spec_prophet <- prophet_reg(
+  seasonality_yearly = TRUE,
+  seasonality_weekly = TRUE
+) %>% set_engine("prophet")
+
+spec_xgb <- boost_tree(trees = 1000, tree_depth = 3, learn_rate = 0.05) %>%
+  set_engine("xgboost", objective = "reg:squarederror") %>%
+  set_mode("regression")
+
+spec_arima <- arima_reg() %>% set_engine("auto_arima")
+
+spec_glmnet <- linear_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet") %>%
+  set_mode("regression")
+
+fit_prophet <- workflow() %>%
+  add_model(spec_prophet) %>%
+  add_recipe(rec_prophet) %>%
+  fit(train_data)
+
+fit_xgb <- workflow() %>%
+  add_model(spec_xgb) %>%
+  add_recipe(rec_ml) %>%
+  fit(train_data)
+
+fit_arima <- workflow() %>%
+  add_model(spec_arima) %>%
+  add_recipe(recipe(daily_mean_load ~ Date + daily_mean_temp + daily_mean_rh,
+                    data = train_data)) %>%
+  fit(train_data)
+
+cat("Baseline models fitted.\n")
+
+spec_prophet_tune <- prophet_reg(
+  seasonality_yearly       = TRUE,
+  seasonality_weekly       = TRUE,
+  prior_scale_changepoints = tune(),
+  prior_scale_seasonality  = tune()
+) %>% set_engine("prophet")
+
+prophet_grid <- expand.grid(
+  prior_scale_changepoints = c(0.005, 0.01, 0.05, 0.1),
+  prior_scale_seasonality  = c(0.1, 0.5, 1,5,10)
+)
+
+cat("Tuning Prophet (", nrow(prophet_grid), "x", nrow(resamples_tscv), "folds)...\n")
+
+tune_prophet <- tune_grid(
+  workflow() %>% add_model(spec_prophet_tune) %>% add_recipe(rec_prophet),
+  resamples = resamples_tscv,
+  grid      = prophet_grid,
+  control   = control_grid(verbose = FALSE, save_pred = TRUE)
+)
+
+best_prophet <- select_best(tune_prophet, metric = "rmse")
+cat("Best Prophet params:\n"); print(best_prophet)
+
+fit_prophet_opt <- finalize_workflow(
+  workflow() %>% add_model(spec_prophet_tune) %>% add_recipe(rec_prophet),
+  best_prophet
+) %>% fit(train_data)
+
+
+spec_xgb_tune <- boost_tree(
+  trees      = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  min_n      = tune()
+) %>%
+  set_engine("xgboost", objective = "reg:squarederror") %>%
+  set_mode("regression")
+
+xgb_grid <- expand.grid(
+  trees      = c(500),
+  tree_depth = c(3),
+  learn_rate = c(0.01, 0.05),
+  min_n      = c(5, 20)
+)
+
+cat("Tuning XGBoost (", nrow(xgb_grid), "combinations)...\n")
+
+tune_xgb <- tune_grid(
+  workflow() %>% add_model(spec_xgb_tune) %>% add_recipe(rec_ml),
+  resamples = resamples_tscv,
+  grid      = xgb_grid,
+  control   = control_grid(verbose = FALSE)
+)
+
+best_xgb <- select_best(tune_xgb, metric = "rmse")
+cat("Best XGBoost params:\n"); print(best_xgb)
+
+fit_xgb_opt <- finalize_workflow(
+  workflow() %>% add_model(spec_xgb_tune) %>% add_recipe(rec_ml),
+  best_xgb
+) %>% fit(train_data)
+
+
+glmnet_grid <- expand.grid(
+  penalty  = 10^seq(-4, 0, length.out = 6),
+  mixture  = c(0, 0.25, 0.5, 0.75, 1)    # 0=Ridge, 1=Lasso
+)
+
+cat("Tuning GLMNet (", nrow(glmnet_grid), "combinations)...\n")
+
+tune_glmnet <- tune_grid(
+  workflow() %>% add_model(spec_glmnet) %>% add_recipe(rec_ml),
+  resamples = resamples_tscv,
+  grid      = glmnet_grid,
+  control   = control_grid(verbose = FALSE)
+)
+
+best_glmnet <- select_best(tune_glmnet, metric = "rmse")
+cat("Best GLMNet params:\n"); print(best_glmnet)
+fit_glmnet_opt <- finalize_workflow(
+  workflow() %>% add_model(spec_glmnet) %>% add_recipe(rec_ml),
+  best_glmnet
+) %>% fit(train_data)
+
+
+model_table <- modeltime_table(
+  fit_prophet,      # M1: Prophet baseline
+  fit_prophet_opt,  # M2: Prophet tuned
+  fit_xgb,          # M3: XGBoost baseline
+  fit_xgb_opt,      # M4: XGBoost tuned
+  fit_arima,        # M5: Auto-ARIMA
+  fit_glmnet_opt    # M6: GLMNet tuned
+)
+
+calibration_table <- model_table %>%
+  modeltime_calibrate(new_data = val_data)
+
+cat("\n── Validation Accuracy (July 2010 holdout) ──\n")
+print(modeltime_accuracy(calibration_table))
+
+
+cat("\nRefitting all models on full dataset (Jan 2005 – Jun 2011)...\n")
+refit_table <- calibration_table %>%
+  modeltime_refit(data = full_data)
+
+
+final_fcst <- refit_table %>%
+  modeltime_forecast(
+    new_data    = july_2011_features,
+    actual_data = full_data
+  )
+
+preds_list <- list(
+  prophet_base  = final_fcst %>% filter(.model_id == 1, .key == "prediction") %>% pull(.value),
+  prophet_tuned = final_fcst %>% filter(.model_id == 2, .key == "prediction") %>% pull(.value),
+  xgb_base      = final_fcst %>% filter(.model_id == 3, .key == "prediction") %>% pull(.value),
+  xgb_tuned     = final_fcst %>% filter(.model_id == 4, .key == "prediction") %>% pull(.value),
+  arima         = final_fcst %>% filter(.model_id == 5, .key == "prediction") %>% pull(.value),
+  glmnet        = final_fcst %>% filter(.model_id == 6, .key == "prediction") %>% pull(.value)
+)
+
+
+# ── CHUNK 14: ENSEMBLES ───────────────────────────────────────────────────────
+# Three ensemble strategies. Accuracy-weighted uses val RMSE as inverse weights.
+
+ensemble_simple <- rowMeans(bind_cols(preds_list))
+
+val_rmse <- modeltime_accuracy(calibration_table) %>%
+  arrange(.model_id) %>%
+  pull(rmse)
+
+inv_rmse_weights <- (1 / val_rmse) / sum(1 / val_rmse)
+cat("Ensemble weights (inv-RMSE):", round(inv_rmse_weights, 3), "\n")
+
+ensemble_wtd <- as.matrix(bind_cols(preds_list)) %*% inv_rmse_weights %>% as.numeric()
+
+top2_ids <- order(val_rmse)[1:2]
+ensemble_top2 <- rowMeans(bind_cols(preds_list)[, top2_ids])
+
+cat("\nEnsemble preview (first 5 days):\n")
+print(tibble(
+  Date            = july_dates_2011[1:5],
+  simple_avg      = round(ensemble_simple[1:5]),
+  weighted_avg    = round(ensemble_wtd[1:5]),
+  top2_avg        = round(ensemble_top2[1:5])
+))
+
+
+save_sub(list(mean = preds_list$prophet_base),  "Sub_Prophet_Base.csv")
+save_sub(list(mean = preds_list$prophet_tuned), "Sub_Prophet_Tuned.csv")
+save_sub(list(mean = preds_list$xgb_base),      "Sub_XGBoost_Base.csv")
+save_sub(list(mean = preds_list$xgb_tuned),     "Sub_XGBoost_Tuned.csv")
+save_sub(list(mean = preds_list$arima),          "Sub_ARIMA.csv")
+save_sub(list(mean = preds_list$glmnet),         "Sub_GLMNet.csv")
+save_sub(list(mean = ensemble_simple),           "Sub_Ensemble_Simple.csv")
+save_sub(list(mean = ensemble_wtd),              "Sub_Ensemble_Weighted.csv")
+save_sub(list(mean = ensemble_top2),             "Sub_Ensemble_Top2.csv")
+
+cat("\nAll submissions saved.\n")
 ```

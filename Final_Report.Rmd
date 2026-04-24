@@ -1,0 +1,624 @@
+---
+title: "ENV 797 - Time Series Analysis for Energy and Environment Applications | Spring 2026"
+subtitle: "Forecasting Competition Final Report"
+author: "Joy Wu, Aisha Shen"
+output: pdf_document
+geometry: margin=2.54cm
+---
+
+
+## Setting R code chunk options
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,warning=FALSE, message=FALSE,tidy.opts=list(width.cutoff=80), tidy=FALSE) 
+```
+
+## GitHub Repository: [ShenWu_GithubRepo](https://github.com/jzwu01/ShenWu_ENV797_TSA_ForecastCompetition_S26)
+
+## Overview
+
+This report implements and evaluates **five Prophet-based forecasting models** for daily electricity demand, forecasting July 2011 using data from January 2005 to June 2011.
+
+| Model | Regressors | Tuned | CV Window | Selection Metric |
+|---|-------|:---:|:---:|-----------|:---:|
+|`Submission_Prophet_Tuned` | Yes | Yes | 5 years | MAPE |
+|`Sub_M4_Prophet_NoReg_Baseline` | No | Yes | 5 years | RMSE |
+|`Sub_M4_Prophet_NoReg_Baseline (v2)` | No | Yes | 5 years | MAPE |
+|`Submission_Prophet_Tuned_NEW` | No | Yes | 4 years | MAPE |
+|`Submission_Prophet_Tuned_Newest51` | No | Yes | 5 years | MAPE |
+
+All models use daily (site-level averaged) data with walk-forward cross-validation (1-month horizon, 1-month skip). All five models are tuned via grid search.
+
+The hyperparameters searched across all models are: `prior_scale_changepoints`, `prior_scale_seasonality` , `prior_scale_holidays` (active grid; full sweep values listed in Section 10 and commented out to make compiling easier). Structural parameters `n.changepoints`, `changepoint.range`, and `seasonality.mode` are fixed via `set_engine()`.
+
+Additionally, we tested different loss terms like MAE, RMSE and MAPE (We discovered the MAPE metric late!)
+
+We relied on Prophet for all our best models as it is a very flexible Bayesian Model that generally has strong performance for seasonal data and worked very well. We found it easy to use as it has a good codebase and extensive documentation and online help.
+
+We used LLMs to troubleshoot and clean up our code as well as to generate the hyper parameter sweep setup. 
+
+### 1.2 Load Packages
+```{r packages, message=FALSE, warning=FALSE}
+library(lubridate)
+library(ggplot2)
+library(forecast)
+library(Kendall)
+library(tseries)
+library(outliers)
+library(tidyverse)
+library(smooth)
+library(zoo)
+library(kableExtra)
+library(readxl)
+library(tidymodels)
+library(modeltime)
+library(timetk)
+library(tune)
+library(dials)
+```
+
+---
+
+## 2. Data Import
+
+The dataset comes from the Kaggle competition platform. There are three files: hourly electricity demand (load), hourly temperature, and hourly relative humidity from January 2005 to June 2011. The load file has one row per day with 24 columns (h1 to h24) representing hourly readings. The temperature and humidity files have one row per hour with readings from 28 weather stations.
+
+```{r import-data}
+load_data <- read_excel("./Data/load.xlsx")
+temp_data <- read_excel("./Data/temperature.xlsx")
+rh_data   <- read_excel("./Data/relative_humidity.xlsx")
+
+head(load_data)
+cat("Load data rows:", nrow(load_data), "\n")
+cat("Temp data rows:", nrow(temp_data), "\n")
+cat("RH data rows:",  nrow(rh_data),   "\n")
+```
+
+
+
+## 3. Data Wrangling
+
+### 3.1 Daily Load (averaged across 24 hourly columns)
+```{r process-load-daily}
+load_daily <- load_data %>%
+  mutate(date = ymd(date)) %>%
+  rename(Date = date) %>%
+  pivot_longer(cols = h1:h24, names_to = "hour", values_to = "load") %>%
+  group_by(Date) %>%
+  summarise(daily_mean_load = mean(load, na.rm = TRUE))
+
+cat("NAs in daily load:", sum(is.na(load_daily$daily_mean_load)), "\n")
+summary(load_daily)
+```
+
+### 3.2 Daily Temperature (averaged across 28 stations)
+```{r process-temp-daily}
+# Single-column daily average (used as regressor in M1)
+temp_daily <- temp_data %>%
+  mutate(date = ymd(date)) %>%
+  rename(Date = date) %>%
+  pivot_longer(cols = t_ws1:t_ws28, names_to = "station", values_to = "temp") %>%
+  group_by(Date) %>%
+  summarise(daily_mean_temp = mean(temp, na.rm = TRUE)) %>%
+  filter(!is.na(Date))
+
+# All-station daily averages (used for future regressor construction)
+temp_daily_allsites <- temp_data %>%
+  mutate(date = ymd(date)) %>%
+  rename(Date = date) %>%
+  filter(!is.na(Date)) %>%
+  group_by(Date) %>%
+  summarise(across(t_ws1:t_ws28, ~ mean(.x, na.rm = TRUE)))
+
+summary(temp_daily)
+```
+
+### 3.3 Daily Relative Humidity (averaged across 28 stations)
+```{r process-rh-daily}
+# Single-column daily average (used as regressor in M1)
+rh_daily <- rh_data %>%
+  mutate(date = ymd(date)) %>%
+  rename(Date = date) %>%
+  pivot_longer(cols = rh_ws1:rh_ws28, names_to = "station", values_to = "rh") %>%
+  group_by(Date) %>%
+  summarise(daily_mean_rh = mean(rh, na.rm = TRUE)) %>%
+  filter(!is.na(Date))
+
+# All-station daily averages
+rh_daily_allsites <- rh_data %>%
+  mutate(date = ymd(date)) %>%
+  rename(Date = date) %>%
+  filter(!is.na(Date)) %>%
+  group_by(Date) %>%
+  summarise(across(rh_ws1:rh_ws28, ~ mean(.x, na.rm = TRUE)))
+
+summary(rh_daily)
+```
+
+### 3.4 Combined Daily Dataset (with gap-filling)
+```{r combine-daily}
+daily_data <- load_daily %>%
+  left_join(temp_daily, by = "Date") %>%
+  left_join(rh_daily,   by = "Date")
+
+# Full consolidated frame (all station columns) with forward/backward fill
+df_final <- daily_data %>%
+  left_join(temp_daily_allsites, by = "Date") %>%
+  left_join(rh_daily_allsites,   by = "Date") %>%
+  arrange(Date) %>%
+  fill(everything(), .direction = "downup")
+
+head(df_final)
+summary(df_final)
+```
+
+
+
+## 4. Exploratory Plots
+```{r exploratory-plots, fig.height=4}
+ggplot(daily_data, aes(x = Date, y = daily_mean_load)) +
+  geom_line(color = "steelblue") +
+  labs(title = "Daily Electricity Demand: Jan 2005 - Jun 2011",
+       y = "Daily Mean Load (Wh)", x = "Date")
+
+ggplot(daily_data, aes(x = Date, y = daily_mean_temp)) +
+  geom_line(color = "firebrick") +
+  labs(title = "Daily Mean Temperature: Jan 2005 - Jun 2011",
+       y = "Temperature (F)", x = "Date")
+
+ggplot(daily_data, aes(x = Date, y = daily_mean_rh)) +
+  geom_line(color = "darkgreen") +
+  labs(title = "Daily Mean Relative Humidity: Jan 2005 - Jun 2011",
+       y = "Relative Humidity (%)", x = "Date")
+```
+
+
+
+## 5. Time Series Decomposition and Autocorrelation
+```{r decomposition, fig.height=6}
+ts_daily_load <- msts(daily_data$daily_mean_load,
+                      seasonal.periods = c(7, 365.25),
+                      start = c(2005, 1))
+
+ts_daily_load %>%
+  mstl() %>%
+  autoplot() +
+  ggtitle("STL Decomposition of Daily Electricity Demand")
+```
+
+```{r acf-pacf}
+par(mfrow = c(1, 2))
+Acf(daily_data$daily_mean_load,  lag.max = 40, main = "ACF - Daily Load")
+Pacf(daily_data$daily_mean_load, lag.max = 40, main = "PACF - Daily Load")
+par(mfrow = c(1, 1))
+```
+
+
+
+## 6. Train / Validation / Full-Data Splits
+
+**Training:** Jan 1, 2005 - Jun 30, 2010  
+**Validation:** Jul 1 - Jul 31, 2010 (31 days, mirrors the forecast horizon)  
+**Full data:** Jan 1, 2005 - Jun 30, 2011 (used for final refitting before submission)
+
+```{r splits}
+train_data <- df_final %>% filter(Date <= as.Date("2010-06-30"))
+val_data   <- df_final %>% filter(Date >= as.Date("2010-07-01") &
+                                   Date <= as.Date("2010-07-31"))
+full_data  <- df_final %>% filter(Date <= as.Date("2011-06-30"))
+
+july_dates_2011 <- seq(as.Date("2011-07-01"), as.Date("2011-07-31"), by = "day")
+
+cat("Split sizes - Train:", nrow(train_data),
+    "| Val:", nrow(val_data),
+    "| Full:", nrow(full_data), "\n")
+```
+
+
+
+## 7. Future Regressor Construction (M1 only)
+
+Temperature and humidity for July 2011 are estimated using a recency-weighted average of historical July values, giving more weight to recent years.
+
+```{r future-regressors}
+historical_julys <- df_final %>%
+  filter(month(Date) == 7, year(Date) < 2011) %>%
+  mutate(
+    day_of_month = day(Date),
+    year_weight  = year(Date) - 2004   # 2005 -> 1, ..., 2010 -> 6
+  )
+
+july_2011_features <- historical_julys %>%
+  group_by(day_of_month) %>%
+  summarise(across(
+    .cols = where(is.numeric) & !contains("load") & !contains("year_weight"),
+    .fns  = ~ weighted.mean(.x, w = year_weight, na.rm = TRUE)
+  )) %>%
+  ungroup() %>%
+  mutate(Date = as.Date(paste0("2011-07-", str_pad(day_of_month, 2, pad = "0")))) %>%
+  select(Date, everything(), -day_of_month)
+
+cat("Future regressor rows:", nrow(july_2011_features), "\n")
+```
+
+
+
+## 8. Cross-Validation Setup
+
+Walk-forward CV with 1-month assessment windows, 1-month skip, and cumulative (expanding) training window. Two CV objects are created: a 5-year initial window (M1, M2, M3, M5) and a 4-year initial window (M4).
+
+```{r cv-setup}
+# 5-year initial window: M1, M2, M3, M5
+resamples_5yr <- time_series_cv(
+  data       = train_data,
+  date_var   = Date,
+  initial    = "5 years",
+  assess     = "1 month",
+  skip       = "1 month",
+  cumulative = TRUE
+)
+
+# 4-year initial window: M4
+resamples_4yr <- time_series_cv(
+  data       = train_data,
+  date_var   = Date,
+  initial    = "4 years",
+  assess     = "1 month",
+  #skip       = "1 month",
+  cumulative = TRUE
+)
+
+cat("CV folds (5-year):", nrow(resamples_5yr), "\n")
+cat("CV folds (4-year):", nrow(resamples_4yr), "\n")
+```
+
+
+
+## 9. Recipes
+
+```{r recipes}
+# M1: with temperature and humidity regressors
+rec_with_reg <- recipe(
+  daily_mean_load ~ Date + daily_mean_temp + daily_mean_rh,
+  data = train_data
+)
+
+# M2, M3, M4, M5: date only
+rec_no_reg <- recipe(
+  daily_mean_load ~ Date,
+  data = train_data
+)
+```
+
+
+
+## 10. Tuning Grid
+
+Tuned models (M1, M2, M3) share the same hyperparameter search space. The full grid below was used in the original extensive sweep. It is commented out here to allow the document to knit in reasonable time; the two-row active grid contains the best-performing combinations identified from that sweep.
+
+```{r tuning-grid}
+# ---------------------------------------------------------
+# FULL GRID (used in original extensive hyperparameter sweep)
+# Uncomment to reproduce the full search (~300 combinations)
+# ---------------------------------------------------------
+# prophet_grid_full <- expand.grid(
+#   prior_scale_changepoints = c(0.001, 0.005, 0.01, 0.05, 0.1, 0.5),
+#   prior_scale_seasonality  = c(0.1, 0.5, 1, 3, 5, 8, 10, 15, 20),
+#   prior_scale_holidays     = c(0.1, 1.0, 10.0)
+# )
+# cat("Full grid size:", nrow(prophet_grid_full), "\n")
+
+# ---------------------------------------------------------
+# ACTIVE GRID (reduced for knitting; two combinations
+# from the full sweep above, selected by CV MAPE)
+# ---------------------------------------------------------
+prophet_grid <- tibble(
+  prior_scale_changepoints = c(0.005, 0.05),
+  prior_scale_seasonality  = c(3.0,   10.0),
+  prior_scale_holidays     = c(1.0,   10.0)
+)
+
+cat("Active grid size:", nrow(prophet_grid), "\n")
+print(prophet_grid)
+```
+
+---
+
+## 11. Model Fitting
+
+### M1: Prophet with Regressors — Tuned (5-year CV, MAPE)
+
+Additive seasonal model with temperature and humidity regressors. Hyperparameters were originally identified via RMSE and are re-evaluated here on MAPE for consistency with the competition metric.
+
+```{r m1-fit}
+spec_m1_tune <- prophet_reg(
+  seasonality_yearly       = TRUE,
+  seasonality_weekly       = TRUE,
+  prior_scale_changepoints = tune(),
+  prior_scale_seasonality  = tune(),
+  prior_scale_holidays     = tune()
+) %>%
+  set_engine("prophet",
+             n.changepoints    = 22,
+             changepoint.range = 0.72,
+             seasonality.mode  = "additive")
+
+wf_m1 <- workflow() %>%
+  add_model(spec_m1_tune) %>%
+  add_recipe(rec_with_reg)
+
+cat("Tuning M1 (", nrow(prophet_grid), "combos x",
+    nrow(resamples_5yr), "folds)...\n")
+
+tune_m1 <- tune_grid(
+  wf_m1,
+  resamples = resamples_5yr,
+  grid      = prophet_grid,
+  metrics   = metric_set(mape),
+  control   = control_grid(verbose = FALSE, save_pred = TRUE)
+)
+
+best_m1 <- select_best(tune_m1, metric = "mape")
+cat("M1 best params:\n"); print(best_m1)
+
+fit_m1 <- finalize_workflow(wf_m1, best_m1) %>% fit(train_data)
+cat("M1 fitted.\n")
+```
+
+### M2: Prophet without Regressors — Tuned (5-year CV, RMSE)
+
+No-regressor tuned model. Same spec and grid as M1 but without weather regressors. Best parameters selected by **RMSE** (original metric used before switching to MAPE).
+
+```{r m2-fit}
+spec_m2_tune <- prophet_reg(
+  seasonality_yearly       = TRUE,
+  seasonality_weekly       = TRUE,
+  prior_scale_changepoints = tune(),
+  prior_scale_seasonality  = tune(),
+  prior_scale_holidays     = tune()
+) %>%
+  set_engine("prophet",
+             n.changepoints    = 28,
+             changepoint.range = 0.72,
+             seasonality.mode  = "additive")
+
+wf_m2 <- workflow() %>%
+  add_model(spec_m2_tune) %>%
+  add_recipe(rec_no_reg)
+
+cat("Tuning M2 (", nrow(prophet_grid), "combos x",
+    nrow(resamples_5yr), "folds)...\n")
+
+tune_m2 <- tune_grid(
+  wf_m2,
+  resamples = resamples_5yr,
+  grid      = prophet_grid,
+  metrics   = metric_set(rmse, mape),
+  control   = control_grid(verbose = FALSE, save_pred = TRUE)
+)
+
+best_m2 <- select_best(tune_m2, metric = "rmse")   # selected by RMSE
+cat("M2 best params:\n"); print(best_m2)
+
+fit_m2 <- finalize_workflow(wf_m2, best_m2) %>% fit(train_data)
+cat("M2 fitted.\n")
+```
+
+### M3: Prophet without Regressors — Tuned v2 (5-year CV, MAPE)
+
+Identical to M2 in every way except best parameters are selected by **MAPE** instead of RMSE. This is the updated submission reflecting the competition's target metric.
+
+```{r m3-fit}
+spec_m3_tune <- prophet_reg(
+  seasonality_yearly       = TRUE,
+  seasonality_weekly       = TRUE,
+  prior_scale_changepoints = tune(),
+  prior_scale_seasonality  = tune(),
+  prior_scale_holidays     = tune()
+) %>%
+  set_engine("prophet",
+             n.changepoints    = 18,
+             changepoint.range = 0.65,
+             seasonality.mode  = "additive")
+
+wf_m3 <- workflow() %>%
+  add_model(spec_m3_tune) %>%
+  add_recipe(rec_no_reg)
+
+cat("Tuning M3 (", nrow(prophet_grid), "combos x",
+    nrow(resamples_5yr), "folds)...\n")
+
+tune_m3 <- tune_grid(
+  wf_m3,
+  resamples = resamples_5yr,
+  grid      = prophet_grid,
+  metrics   = metric_set(rmse, mape),
+  control   = control_grid(verbose = FALSE, save_pred = TRUE)
+)
+
+best_m3 <- select_best(tune_m3, metric = "mape")   # selected by MAPE
+cat("M3 best params:\n"); print(best_m3)
+
+fit_m3 <- finalize_workflow(wf_m3, best_m3) %>% fit(train_data)
+cat("M3 fitted.\n")
+```
+
+### M4: Prophet without Regressors — Tuned (4-year CV, MAPE)
+
+Additive seasonal model, no regressors, tuned via grid search. Uses a shorter 4-year CV window. Best parameters selected by MAPE.
+
+```{r m4-fit}
+spec_m4_tune <- prophet_reg(
+  seasonality_yearly       = TRUE,
+  seasonality_weekly       = TRUE,
+  prior_scale_changepoints = tune(),
+  prior_scale_seasonality  = tune(),
+  prior_scale_holidays     = tune()
+) %>%
+  set_engine("prophet",
+             n.changepoints    = 28,
+             changepoint.range = 0.72,
+             seasonality.mode  = "additive")
+
+wf_m4 <- workflow() %>%
+  add_model(spec_m4_tune) %>%
+  add_recipe(rec_no_reg)
+
+cat("Tuning M4 (", nrow(prophet_grid), "combos x",
+    nrow(resamples_4yr), "folds)...\n")
+
+tune_m4 <- tune_grid(
+  wf_m4,
+  resamples = resamples_4yr,
+  grid      = prophet_grid,
+  metrics   = metric_set(rmse, mape),
+  control   = control_grid(verbose = FALSE, save_pred = TRUE)
+)
+
+best_m4 <- select_best(tune_m4, metric = "mape")
+cat("M4 best params:\n"); print(best_m4)
+
+fit_m4 <- finalize_workflow(wf_m4, best_m4) %>% fit(train_data)
+cat("M4 fitted.\n")
+```
+
+### M5: Prophet without Regressors — Tuned (5-year CV, MAPE)
+
+Additive seasonal model, no regressors, tuned via grid search. Uses the longer 5-year CV window. Best parameters selected by MAPE.
+
+```{r m5-fit}
+spec_m5_tune <- prophet_reg(
+  seasonality_yearly       = TRUE,
+  seasonality_weekly       = TRUE,
+  prior_scale_changepoints = tune(),
+  prior_scale_seasonality  = tune(),
+  prior_scale_holidays     = tune()
+) %>%
+  set_engine("prophet",
+             n.changepoints    = 28,
+             changepoint.range = 0.72,
+             seasonality.mode  = "additive")
+
+wf_m5 <- workflow() %>%
+  add_model(spec_m5_tune) %>%
+  add_recipe(rec_no_reg)
+
+cat("Tuning M5 (", nrow(prophet_grid), "combos x",
+    nrow(resamples_5yr), "folds)...\n")
+
+tune_m5 <- tune_grid(
+  wf_m5,
+  resamples = resamples_5yr,
+  grid      = prophet_grid,
+  metrics   = metric_set(rmse, mape),
+  control   = control_grid(verbose = FALSE, save_pred = TRUE)
+)
+
+best_m5 <- select_best(tune_m5, metric = "mape")
+cat("M5 best params:\n"); print(best_m5)
+
+fit_m5 <- finalize_workflow(wf_m5, best_m5) %>% fit(train_data)
+cat("M5 fitted.\n")
+```
+---
+
+## 12. Final Refit on Full Data and Forecasting July 2011
+
+```{r refit-forecast}
+model_table <- modeltime_table(
+fit_m1, # M1: Prophet + regressors, tuned
+fit_m2, # M2: Prophet no regressors, tuned
+fit_m3, # M3: Prophet no regressors, tuned v2
+fit_m4, # M4: Prophet no regressors, baseline 4yr CV
+fit_m5 # M5: Prophet no regressors, baseline 5yr CV
+)
+calibration_table <- model_table %>%
+modeltime_calibrate(new_data = val_data)
+cat("\n-- Validation Accuracy (July 2010 holdout) --\n")
+cat("Refitting all models on full dataset (Jan 2005 - Jun 2011)...\n")
+
+refit_table <- calibration_table %>%
+  modeltime_refit(data = full_data)
+
+# M1 requires future regressors; M2-M5 only need dates
+future_with_reg <- july_2011_features
+future_no_reg   <- tibble(Date = july_dates_2011)
+
+# Forecast M1 separately (requires regressors)
+fcst_m1 <- refit_table %>%
+  filter(.model_id == 1) %>%
+  modeltime_forecast(
+    new_data    = future_with_reg,
+    actual_data = full_data
+  )
+
+# Forecast M2-M5 together (no regressors)
+fcst_m2_m5 <- refit_table %>%
+  filter(.model_id %in% c(2, 3, 4, 5)) %>%
+  modeltime_forecast(
+    new_data    = future_no_reg,
+    actual_data = full_data
+  )
+
+# Extract prediction vectors
+preds_m1 <- fcst_m1    %>% filter(.key == "prediction") %>% pull(.value)
+preds_m2 <- fcst_m2_m5 %>% filter(.model_id == 2, .key == "prediction") %>% pull(.value)
+preds_m3 <- fcst_m2_m5 %>% filter(.model_id == 3, .key == "prediction") %>% pull(.value)
+preds_m4 <- fcst_m2_m5 %>% filter(.model_id == 4, .key == "prediction") %>% pull(.value)
+preds_m5 <- fcst_m2_m5 %>% filter(.model_id == 5, .key == "prediction") %>% pull(.value)
+
+cat("Forecast lengths - M1:", length(preds_m1), "M2:", length(preds_m2),
+    "M3:", length(preds_m3), "M4:", length(preds_m4), "M5:", length(preds_m5), "\n")
+```
+
+---
+
+## 13. Forecast Visualization
+
+```{r plot-all-models, fig.height=5}
+tibble(
+  Date                             = july_dates_2011,
+  `M1: Prophet+Reg Tuned`         = preds_m1,
+  `M2: NoReg Tuned`               = preds_m2,
+) %>%
+  pivot_longer(-Date, names_to = "Model", values_to = "Prediction") %>%
+  ggplot(aes(x = Date, y = Prediction, color = Model)) +
+  geom_line(linewidth = 0.8) +
+  labs(title = "Select Prophet Forecasts: July 2011",
+       x = "Date", y = "Predicted Daily Mean Load (Wh)", color = "Model") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 7))
+```
+
+---
+
+
+
+
+
+```{r save-submissions}
+save_sub <- function(preds_vec, filename) {
+  tibble(
+    date = format(july_dates_2011, "%Y-%m-%d"),
+    load = round(preds_vec, 2)
+  ) %>%
+    write_csv(file.path("./Submissions", filename))
+  cat("Saved:", filename, "\n")
+}
+
+dir.create("./Submissions", showWarnings = FALSE)
+
+save_sub(preds_m1, "Submission_Prophet_Tuned.csv")
+save_sub(preds_m2, "Sub_M4_Prophet_NoReg_Baseline.csv")
+save_sub(preds_m3, "Sub_M4_Prophet_NoReg_Baseline_v2.csv")
+save_sub(preds_m4, "Submission_Prophet_Tuned_NEW.csv")
+save_sub(preds_m5, "Submission_Prophet_Tuned_Newest51.csv")
+
+cat("\nAll 5 submissions saved to ./Submissions/\n")
+```
+
+---
+
+
+
